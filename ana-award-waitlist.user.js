@@ -1,0 +1,835 @@
+// ==UserScript==
+// @name         ANA Award Waitlist (THE Room)
+// @namespace    https://github.com/wang4433/ANA-Award-Waitlist
+// @version      0.1.0
+// @description  Auto-waitlist whitelisted ANA Business (THE Room) flights on a chosen date.
+// @author       wang4433
+// @match        https://aswbe-i.ana.co.jp/*
+// @match        https://aswbe.ana.co.jp/*
+// @run-at       document-idle
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_notification
+// @noframes
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ============================================================================
+  // 1. CONFIG  — user-edit zone. Flip flags here.
+  // ============================================================================
+  const CONFIG = {
+    // Safety
+    DRY_RUN: true,                     // true = log intended clicks but never submit
+    CONFIRM_BEFORE_FINAL_SUBMIT: true, // window.confirm() gate before the very last click
+    MAX_WAITLISTS_PER_RUN: 5,          // hard cap; script aborts when reached
+
+    // Behavior
+    CABIN: 'J',                        // Business class only
+    AUTO_RESUME_AFTER_NAV: true,       // when a page loads mid-run, continue the flow
+
+    // Discovery / debugging
+    SELECTOR_DISCOVERY_MODE: false,    // dump page DOM info to console on every page
+    VERBOSE_LOGGING: true,
+
+    // Timing
+    WAIT_FOR_DOM_MS: 8000,             // how long to wait for a selector to appear
+    POST_NAV_SETTLE_MS: 1500,          // pause after a navigation before acting
+    MAX_STUCK_RETRIES: 3,              // give up on an UNKNOWN page after this many loads
+    MAX_STALE_MS: 5 * 60 * 1000,       // dead-man's switch: reset if state is older than this
+
+    // THE Room flight whitelist.  Verify against current seasonal deployment.
+    // Compare is normalized (uppercase, no spaces, no leading zeros).
+    THE_ROOM_WHITELIST: [
+      'NH9', 'NH10', 'NH11', 'NH12',          // user-supplied seed
+      'NH201', 'NH202', 'NH211', 'NH212',     // LHR
+      'NH203', 'NH204',                        // LHR alt
+      'NH223', 'NH224',                        // FRA
+      // Candidates to verify before adding:
+      // 'NH105','NH106','NH109','NH110','NH111','NH112'
+    ],
+  };
+
+  // ============================================================================
+  // 2. SELECTORS  — placeholders.  Run with SELECTOR_DISCOVERY_MODE=true on
+  //    each page, then paste the real selectors here.  Arrays are tried in
+  //    order; first match wins.
+  // ============================================================================
+  const SELECTORS = {
+    // Search input page
+    searchSubmitButton: [
+      '#searchSubmit',
+      'button[name="search"]',
+      'input[type="submit"][value*="検索" i]',
+      'button.btn-search',
+    ],
+
+    // Results page
+    resultsTable: ['#flightResultsTable', '.flight-results', 'table.results'],
+    resultsRow: ['tr.flight-row', 'tr[data-flight-no]', 'li.flight-item'],
+    resultsRowFlightNumber: ['.flight-number', '[data-flight-no]', '.flt-no'],
+    resultsRowWaitlistJButton: [
+      'button.waitlist-j',
+      '[data-cabin="J"] button.waitlist',
+      'a.waitlist-j',
+    ],
+
+    // Multi-step confirmation pages
+    paxConfirmMarker: ['#pax-confirm', '.passenger-confirm', '[data-page="passenger"]'],
+    paxConfirmNextButton: ['button.next', '#toItinerary', 'input[type="submit"]'],
+
+    itineraryMarker: ['#itinerary', '.itinerary-review', '[data-page="itinerary"]'],
+    itineraryFlightNumber: ['.flt-num', '.flight-number', '[data-flight-no]'],
+    itineraryNextButton: ['button.next', '#toPersonal', 'input[type="submit"]'],
+
+    personalInfoMarker: ['#personal-info', '.personal-info', '[data-page="personal"]'],
+    personalInfoAgreeCheckboxes: ['input.agree[type="checkbox"]', 'input[type="checkbox"][required]'],
+    personalInfoNextButton: ['button.next', '#toConfirm', 'input[type="submit"]'],
+
+    finalSubmitButton: ['#finalSubmit', 'button.submit-final', 'input[type="submit"][value*="確定" i]'],
+    finalSubmitFlightNumber: ['.flt-num', '.flight-number', '[data-flight-no]'],
+
+    successMarker: ['.booking-complete', '#success', '[data-page="complete"]'],
+    successBackToResultsLink: ['a.back-to-results', 'a[href*="search"]'],
+
+    // Error / abort conditions
+    captchaMarker: ['#captcha', '.error-rate-limit', '.g-recaptcha'],
+    logoutMarker: ['#loginForm', 'input[name="amcMemberNumber"]'],
+  };
+
+  // Selectors that MUST resolve or we hard-abort.
+  const CRITICAL_SELECTORS = ['searchSubmitButton', 'resultsRow', 'finalSubmitButton', 'successMarker'];
+
+  // ============================================================================
+  // 3. PAGE_MARKERS  — URL regex + DOM probe combos to identify the current page
+  // ============================================================================
+  const PAGE_MARKERS = {
+    SEARCH_INPUT:     { urlRegex: /award_search_roundtrip_input\.xhtml/i, probeKey: 'searchSubmitButton' },
+    RESULTS:          { urlRegex: /award_search_roundtrip_(result|select)|select_flight/i, probeKey: 'resultsRow' },
+    PAX_CONFIRM:      { urlRegex: /pax_confirm|passenger/i, probeKey: 'paxConfirmMarker' },
+    ITINERARY_REVIEW: { urlRegex: /itinerary|fare_confirm/i, probeKey: 'itineraryMarker' },
+    PERSONAL_INFO:    { urlRegex: /personal_info|contact/i, probeKey: 'personalInfoMarker' },
+    FINAL_SUBMIT:     { urlRegex: /final_confirm|booking_confirm/i, probeKey: 'finalSubmitButton' },
+    SUCCESS:          { urlRegex: /complete|success|booking_complete/i, probeKey: 'successMarker' },
+    CAPTCHA_OR_RL:    { urlRegex: /error|maintenance|captcha/i, probeKey: 'captchaMarker' },
+    LOGIN:            { urlRegex: /login|signin/i, probeKey: 'logoutMarker' },
+  };
+
+  // ============================================================================
+  // 4. LOG / UTIL
+  // ============================================================================
+  const TAG = '[ANA-WL]';
+  function log(...args)  { console.log(TAG, ...args); }
+  function warn(...args) { console.warn(TAG, ...args); }
+  function err(...args)  { console.error(TAG, ...args); }
+  function debug(...args){ if (CONFIG.VERBOSE_LOGGING) console.log(TAG, '·', ...args); }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  /** Wait for a selector to return ≥1 element, up to timeoutMs. */
+  async function waitFor(selectorOrArray, timeoutMs = CONFIG.WAIT_FOR_DOM_MS) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const el = qFirst(selectorOrArray);
+      if (el) return el;
+      await sleep(150);
+    }
+    return null;
+  }
+
+  /** Try selectors in order; return first matching element (or null). Logs which entry survived. */
+  function qFirst(selectorOrArray) {
+    const list = Array.isArray(selectorOrArray) ? selectorOrArray : [selectorOrArray];
+    for (const sel of list) {
+      if (!sel) continue;
+      try {
+        const el = document.querySelector(sel);
+        if (el) {
+          if (CONFIG.VERBOSE_LOGGING && list.length > 1) debug('selector matched:', sel);
+          return el;
+        }
+      } catch (e) {
+        warn('bad selector', sel, e.message);
+      }
+    }
+    return null;
+  }
+
+  /** Return ALL elements matched by the FIRST selector that yields ≥1 match. */
+  function qAll(selectorOrArray) {
+    const list = Array.isArray(selectorOrArray) ? selectorOrArray : [selectorOrArray];
+    for (const sel of list) {
+      if (!sel) continue;
+      try {
+        const nodes = document.querySelectorAll(sel);
+        if (nodes.length) return Array.from(nodes);
+      } catch (e) {
+        warn('bad selector', sel, e.message);
+      }
+    }
+    return [];
+  }
+
+  /** Click with DRY_RUN respect and a small settle delay. */
+  async function safeClick(el, label) {
+    if (!el) { warn('safeClick: null element for', label); return false; }
+    if (Safety.isDryRun()) { log('DRY_RUN: would click', label); return true; }
+    debug('click', label);
+    el.click();
+    await sleep(150);
+    return true;
+  }
+
+  /** Normalize "NH 009 " → "NH9".  Used for whitelist comparison. */
+  function normalizeFlightNumber(raw) {
+    if (!raw) return '';
+    const s = String(raw).toUpperCase().replace(/\s+/g, '');
+    const m = s.match(/^([A-Z]{2})0*(\d+)$/);
+    return m ? `${m[1]}${m[2]}` : s;
+  }
+
+  function isWhitelisted(rawFlightNumber) {
+    const norm = normalizeFlightNumber(rawFlightNumber);
+    return CONFIG.THE_ROOM_WHITELIST.map(normalizeFlightNumber).includes(norm);
+  }
+
+  // ============================================================================
+  // 5. STATE  — sessionStorage for live run, GM_* for cross-session history
+  // ============================================================================
+  const KEY_PREFIX = 'ana_wl::';
+  const GM_PREFIX  = 'ana_wl_gm::';
+
+  const PHASE = {
+    IDLE: 'IDLE',
+    INITIALIZING: 'INITIALIZING',
+    SUBMITTING_SEARCH: 'SUBMITTING_SEARCH',
+    SCANNING_RESULTS: 'SCANNING_RESULTS',
+    SELECTING_FLIGHT: 'SELECTING_FLIGHT',
+    PAX_CONFIRM: 'PAX_CONFIRM',
+    ITINERARY_REVIEW: 'ITINERARY_REVIEW',
+    PERSONAL_INFO: 'PERSONAL_INFO',
+    FINAL_SUBMIT: 'FINAL_SUBMIT',
+    AWAITING_SUCCESS: 'AWAITING_SUCCESS',
+    SUCCESS: 'SUCCESS',
+    RETURNING_TO_RESULTS: 'RETURNING_TO_RESULTS',
+    DONE: 'DONE',
+    ABORTED: 'ABORTED',
+  };
+
+  const State = {
+    _read(key, fallback) {
+      try {
+        const raw = sessionStorage.getItem(KEY_PREFIX + key);
+        return raw === null ? fallback : JSON.parse(raw);
+      } catch (e) { warn('state read fail', key, e); return fallback; }
+    },
+    _write(key, value) {
+      try { sessionStorage.setItem(KEY_PREFIX + key, JSON.stringify(value)); }
+      catch (e) { warn('state write fail', key, e); }
+    },
+    _del(key) { sessionStorage.removeItem(KEY_PREFIX + key); },
+
+    load() {
+      return this._read('state', { phase: PHASE.IDLE, abortReason: null });
+    },
+    save(s) {
+      s.lastNavAt = Date.now();
+      this._write('state', s);
+    },
+    setPhase(phase, extra = {}) {
+      const s = this.load();
+      s.phase = phase;
+      Object.assign(s, extra);
+      this.save(s);
+      debug('phase →', phase);
+      return s;
+    },
+
+    getQueue()       { return this._read('queue', []); },
+    setQueue(q)      { this._write('queue', q); },
+    getProcessed()   { return this._read('processed', []); },
+    setProcessed(p)  { this._write('processed', p); },
+    getCurrent()     { return this._read('currentFlight', null); },
+    setCurrent(f)    { this._write('currentFlight', f); },
+    clearCurrent()   { this._del('currentFlight'); },
+    getStats()       { return this._read('stats', { waitlisted: 0, skipped: 0, errors: 0, startedAt: null, stuckCount: 0 }); },
+    setStats(st)     { this._write('stats', st); },
+    bumpStat(key, by = 1) {
+      const st = this.getStats();
+      st[key] = (st[key] || 0) + by;
+      this.setStats(st);
+    },
+
+    reset() {
+      ['state', 'queue', 'processed', 'currentFlight', 'stats'].forEach(k => this._del(k));
+      log('state reset');
+    },
+
+    // Cross-session GM history
+    getHistorical() {
+      try { return JSON.parse(GM_getValue(GM_PREFIX + 'historicalWaitlists', '[]')); }
+      catch { return []; }
+    },
+    pushHistorical(entry) {
+      const all = this.getHistorical();
+      all.push(entry);
+      GM_setValue(GM_PREFIX + 'historicalWaitlists', JSON.stringify(all));
+    },
+    isAlreadyDone(flightNumber, dateISO) {
+      const norm = normalizeFlightNumber(flightNumber);
+      return this.getHistorical().some(h =>
+        normalizeFlightNumber(h.flight) === norm && h.dateISO === dateISO);
+    },
+  };
+
+  // ============================================================================
+  // 6. SAFETY  — gates and aborts
+  // ============================================================================
+  const Safety = {
+    isDryRun() {
+      const override = GM_getValue(GM_PREFIX + 'dryRunOverride', null);
+      if (override === 'true') return true;
+      if (override === 'false') return false;
+      return CONFIG.DRY_RUN;
+    },
+
+    killSwitch() {
+      if (localStorage.getItem(KEY_PREFIX + 'kill') === '1') {
+        err('KILL SWITCH ACTIVE — aborting.  Clear with: localStorage.removeItem("ana_wl::kill")');
+        abort('kill_switch');
+        return true;
+      }
+      return false;
+    },
+
+    deadMansSwitch() {
+      const s = State.load();
+      if (s.lastNavAt && Date.now() - s.lastNavAt > CONFIG.MAX_STALE_MS) {
+        warn('dead-man\'s switch tripped (state stale > '
+          + (CONFIG.MAX_STALE_MS / 1000) + 's) — resetting to IDLE');
+        State.reset();
+        return true;
+      }
+      return false;
+    },
+
+    checkCaptcha() {
+      if (PAGE_MARKERS.CAPTCHA_OR_RL.urlRegex.test(location.href)) return true;
+      return !!qFirst(SELECTORS.captchaMarker);
+    },
+
+    checkRateLimit() {
+      const txt = (document.body && document.body.innerText) || '';
+      const hits = [
+        /too many requests/i,
+        /rate limit/i,
+        /アクセスが集中/,
+        /しばらく時間をおいて/,
+        /システムが混雑/,
+      ];
+      return hits.some(re => re.test(txt));
+    },
+
+    checkLogout() {
+      if (PAGE_MARKERS.LOGIN.urlRegex.test(location.href)) return true;
+      return !!qFirst(SELECTORS.logoutMarker);
+    },
+
+    checkCap() {
+      const st = State.getStats();
+      return (st.waitlisted || 0) >= CONFIG.MAX_WAITLISTS_PER_RUN;
+    },
+
+    confirmFinal(current) {
+      if (!CONFIG.CONFIRM_BEFORE_FINAL_SUBMIT) return true;
+      const msg = `[ANA-WL] About to WAITLIST ${current.flightNumber} on ${current.dateISO}.\n\nProceed?`;
+      return window.confirm(msg);
+    },
+  };
+
+  function abort(reason) {
+    err('ABORT:', reason);
+    const s = State.load();
+    s.phase = PHASE.ABORTED;
+    s.abortReason = reason;
+    State.save(s);
+    printStats();
+    try { GM_notification && GM_notification({ text: `ANA Waitlist aborted: ${reason}`, title: 'ANA-WL', timeout: 8000 }); }
+    catch (_) { /* notification grant may not exist */ }
+  }
+
+  function printStats() {
+    const s = State.load();
+    const st = State.getStats();
+    log('── stats ──');
+    log('phase:', s.phase, s.abortReason ? '(' + s.abortReason + ')' : '');
+    log('waitlisted:', st.waitlisted, 'skipped:', st.skipped, 'errors:', st.errors);
+    log('queue remaining:', State.getQueue().length);
+    log('processed:', State.getProcessed().map(f => f.flightNumber + ':' + f.status).join(', '));
+  }
+
+  // ============================================================================
+  // 7. DISCOVERY  — fires when SELECTOR_DISCOVERY_MODE is true
+  // ============================================================================
+  const Discovery = {
+    dumpAll() {
+      console.group(TAG + ' DISCOVERY DUMP');
+      log('URL:', location.href);
+      log('title:', document.title);
+
+      console.group('buttons / submits');
+      const btns = Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], a.btn'));
+      btns.forEach((b, i) => {
+        const text = (b.innerText || b.value || '').trim().slice(0, 60);
+        console.log(i, { tag: b.tagName, id: b.id, cls: b.className, text, name: b.name });
+      });
+      console.groupEnd();
+
+      console.group('forms / inputs');
+      Array.from(document.forms).forEach((f, i) => {
+        console.log('form', i, { id: f.id, name: f.name, action: f.action, method: f.method });
+      });
+      console.groupEnd();
+
+      console.group('candidate flight rows');
+      const candidates = [
+        ...document.querySelectorAll('tr'),
+        ...document.querySelectorAll('[role="row"]'),
+        ...document.querySelectorAll('[class*="flight" i]'),
+        ...document.querySelectorAll('[data-flight-no]'),
+      ];
+      const seen = new Set();
+      candidates.slice(0, 30).forEach(el => {
+        if (seen.has(el)) return; seen.add(el);
+        console.log({ tag: el.tagName, id: el.id, cls: el.className, text: (el.innerText || '').slice(0, 120) });
+      });
+      console.groupEnd();
+
+      console.groupEnd();
+    },
+  };
+
+  // ============================================================================
+  // 8. PAGE HANDLERS
+  // ============================================================================
+
+  async function handleSearchInput() {
+    const s = State.load();
+
+    // Auto-launched on every load.  Only act if user triggered Start.
+    if (s.phase === PHASE.IDLE || s.phase === PHASE.DONE || s.phase === PHASE.ABORTED) {
+      log('on search input page — idle.  Use Tampermonkey menu → "Start ANA Waitlist Run" to begin.');
+      return;
+    }
+
+    if (s.phase !== PHASE.INITIALIZING) {
+      warn('on search input page but phase is', s.phase, '— resetting to IDLE');
+      State.reset();
+      return;
+    }
+
+    log('INITIALIZING — submitting search form');
+    const btn = await waitFor(SELECTORS.searchSubmitButton);
+    if (!btn) { abort('missing_critical_selector:searchSubmitButton'); return; }
+
+    State.setPhase(PHASE.SUBMITTING_SEARCH);
+    if (Safety.isDryRun()) {
+      log('DRY_RUN: would click search submit (skipping navigation)');
+      State.setPhase(PHASE.IDLE);
+      return;
+    }
+    btn.click();
+  }
+
+  async function handleResults() {
+    log('SCANNING_RESULTS');
+    const tableOrRow = await waitFor(SELECTORS.resultsRow);
+    if (!tableOrRow) { abort('missing_critical_selector:resultsRow'); return; }
+
+    await sleep(CONFIG.POST_NAV_SETTLE_MS);
+
+    // Snapshot route/date once on first results visit
+    const s = State.load();
+    if (!s.searchDate) {
+      s.searchDate = guessSearchDateFromPage();
+      State.save(s);
+    }
+    const dateISO = s.searchDate || 'unknown-date';
+
+    const rows = qAll(SELECTORS.resultsRow);
+    debug('rows found:', rows.length);
+
+    // Build queue once per results visit
+    const processedFlightNos = new Set(State.getProcessed().map(f => normalizeFlightNumber(f.flightNumber)));
+    const queue = [];
+
+    for (const row of rows) {
+      const fnEl = row.querySelector(coalesce(SELECTORS.resultsRowFlightNumber)) || row;
+      const rawFn = (fnEl.innerText || fnEl.textContent || '').trim();
+      const fnMatch = rawFn.match(/[A-Z]{2}\s*\d{1,4}/i);
+      if (!fnMatch) continue;
+      const flightNumber = normalizeFlightNumber(fnMatch[0]);
+
+      if (!isWhitelisted(flightNumber)) continue;
+      if (processedFlightNos.has(flightNumber)) continue;
+      if (State.isAlreadyDone(flightNumber, dateISO)) {
+        log('skip', flightNumber, '— already in GM historical for', dateISO);
+        const skipped = { flightNumber, dateISO, status: 'skipped_already_done' };
+        const p = State.getProcessed(); p.push(skipped); State.setProcessed(p);
+        State.bumpStat('skipped');
+        continue;
+      }
+
+      const wlBtn = row.querySelector(coalesce(SELECTORS.resultsRowWaitlistJButton));
+      const eligible = wlBtn && !wlBtn.disabled && !wlBtn.classList.contains('disabled');
+      if (!eligible) {
+        log('skip', flightNumber, '— no waitlist button for J class (not eligible right now)');
+        const skipped = { flightNumber, dateISO, status: 'skipped_ineligible' };
+        const p = State.getProcessed(); p.push(skipped); State.setProcessed(p);
+        State.bumpStat('skipped');
+        continue;
+      }
+
+      queue.push({ flightNumber, dateISO, status: 'pending' });
+    }
+
+    State.setQueue(queue);
+    log('queue built:', queue.length, 'matching flights');
+
+    if (queue.length === 0) {
+      log('no whitelisted waitlist-eligible flights on this date — DONE');
+      State.setPhase(PHASE.DONE);
+      printStats();
+      return;
+    }
+
+    // Pick first pending flight, click its waitlist button
+    const next = queue[0];
+    log('proceeding with', next.flightNumber);
+    State.setCurrent(next);
+
+    // Find row again by flight number text
+    const targetRow = findRowByFlightNumber(rows, next.flightNumber);
+    if (!targetRow) { abort('row_disappeared'); return; }
+
+    const wlBtn = targetRow.querySelector(coalesce(SELECTORS.resultsRowWaitlistJButton));
+    if (!wlBtn) { abort('waitlist_button_missing'); return; }
+
+    State.setPhase(PHASE.SELECTING_FLIGHT);
+    await safeClick(wlBtn, `waitlist button for ${next.flightNumber}`);
+
+    // In DRY_RUN, no navigation will happen; simulate progression to keep the
+    // queue moving so the user can verify the full loop in dry-run.
+    if (Safety.isDryRun()) {
+      log('DRY_RUN: simulating success for', next.flightNumber);
+      finishCurrentFlightAsSuccess(true /* simulated */);
+      State.setPhase(PHASE.SCANNING_RESULTS);
+      await handleResults();
+    }
+  }
+
+  async function handlePaxConfirm() {
+    log('PAX_CONFIRM');
+    const marker = await waitFor(SELECTORS.paxConfirmMarker);
+    if (!marker) warn('paxConfirmMarker not found — proceeding anyway');
+    const btn = await waitFor(SELECTORS.paxConfirmNextButton);
+    if (!btn) { abort('missing_selector:paxConfirmNextButton'); return; }
+    State.setPhase(PHASE.ITINERARY_REVIEW);
+    await safeClick(btn, 'pax confirm Next');
+  }
+
+  async function handleItineraryReview() {
+    log('ITINERARY_REVIEW');
+    const marker = await waitFor(SELECTORS.itineraryMarker);
+    if (!marker) warn('itineraryMarker not found — proceeding anyway');
+
+    if (!verifyCurrentFlightOnPage(SELECTORS.itineraryFlightNumber, 'itinerary review')) return;
+
+    const btn = await waitFor(SELECTORS.itineraryNextButton);
+    if (!btn) { abort('missing_selector:itineraryNextButton'); return; }
+    State.setPhase(PHASE.PERSONAL_INFO);
+    await safeClick(btn, 'itinerary Next');
+  }
+
+  async function handlePersonalInfo() {
+    log('PERSONAL_INFO');
+    const marker = await waitFor(SELECTORS.personalInfoMarker);
+    if (!marker) warn('personalInfoMarker not found — proceeding anyway');
+
+    // Tick any required agreement checkboxes
+    const checkboxes = qAll(SELECTORS.personalInfoAgreeCheckboxes);
+    if (checkboxes.length) {
+      log('ticking', checkboxes.length, 'agreement checkbox(es)');
+      for (const cb of checkboxes) {
+        if (!cb.checked) {
+          if (Safety.isDryRun()) { log('DRY_RUN: would tick', cb.id || cb.name); continue; }
+          cb.click();
+          await sleep(80);
+        }
+      }
+    }
+
+    const btn = await waitFor(SELECTORS.personalInfoNextButton);
+    if (!btn) { abort('missing_selector:personalInfoNextButton'); return; }
+    State.setPhase(PHASE.FINAL_SUBMIT);
+    await safeClick(btn, 'personal info Next');
+  }
+
+  async function handleFinalSubmit() {
+    log('FINAL_SUBMIT');
+    const current = State.getCurrent();
+    if (!current) { abort('no_current_flight'); return; }
+
+    if (!verifyCurrentFlightOnPage(SELECTORS.finalSubmitFlightNumber, 'final submit')) return;
+
+    // Safety gates
+    if (Safety.checkCap()) { abort('cap_reached'); return; }
+    if (!Safety.confirmFinal(current)) { abort('user_declined_confirm'); return; }
+
+    const btn = await waitFor(SELECTORS.finalSubmitButton);
+    if (!btn) { abort('missing_critical_selector:finalSubmitButton'); return; }
+
+    if (Safety.isDryRun()) {
+      log('DRY_RUN: would click FINAL submit for', current.flightNumber, 'on', current.dateISO);
+      finishCurrentFlightAsSuccess(true /* simulated */);
+      State.setPhase(PHASE.SCANNING_RESULTS);
+      // In real run, navigation drives next page.  In DRY_RUN we have no
+      // navigation so just stop here.  The user can re-trigger from results.
+      return;
+    }
+
+    State.setPhase(PHASE.AWAITING_SUCCESS);
+    btn.click();
+  }
+
+  async function handleSuccess() {
+    log('SUCCESS');
+    const marker = await waitFor(SELECTORS.successMarker);
+    if (!marker) { abort('missing_critical_selector:successMarker'); return; }
+
+    finishCurrentFlightAsSuccess(false);
+
+    // Navigate back to results to process next flight
+    State.setPhase(PHASE.RETURNING_TO_RESULTS);
+    const backLink = qFirst(SELECTORS.successBackToResultsLink);
+    if (backLink) {
+      await safeClick(backLink, 'back-to-results link');
+    } else {
+      log('no back-to-results link — using history.back()');
+      history.back();
+    }
+  }
+
+  async function handleUnknown() {
+    const st = State.getStats();
+    st.stuckCount = (st.stuckCount || 0) + 1;
+    State.setStats(st);
+    warn('UNKNOWN page (stuckCount=' + st.stuckCount + ')', 'url:', location.href, 'title:', document.title);
+    if (st.stuckCount >= CONFIG.MAX_STUCK_RETRIES) { abort('unknown_page_max_retries'); return; }
+  }
+
+  // ----- handler helpers -------------------------------------------------------
+
+  function coalesce(selectorOrArray) {
+    // For row.querySelector we need a single string.  Join arrays with comma
+    // (CSS selector list — first match wins per row).
+    return Array.isArray(selectorOrArray) ? selectorOrArray.join(', ') : selectorOrArray;
+  }
+
+  function findRowByFlightNumber(rows, normalizedFn) {
+    for (const row of rows) {
+      const fnEl = row.querySelector(coalesce(SELECTORS.resultsRowFlightNumber)) || row;
+      const txt  = (fnEl.innerText || fnEl.textContent || '').trim();
+      const m = txt.match(/[A-Z]{2}\s*\d{1,4}/i);
+      if (m && normalizeFlightNumber(m[0]) === normalizedFn) return row;
+    }
+    return null;
+  }
+
+  /** Compare the flight number on the current page against state.currentFlight; abort on mismatch. */
+  function verifyCurrentFlightOnPage(selectorOrArray, pageLabel) {
+    const current = State.getCurrent();
+    if (!current) { abort('no_current_flight'); return false; }
+    const el = qFirst(selectorOrArray);
+    if (!el) {
+      warn('no flight-number element on', pageLabel, '— skipping sanity check');
+      return true;
+    }
+    const text = (el.innerText || el.textContent || '').trim();
+    const m = text.match(/[A-Z]{2}\s*\d{1,4}/i);
+    if (!m) {
+      warn('could not extract flight number on', pageLabel, '— text was:', text.slice(0, 80));
+      return true;
+    }
+    const onPage = normalizeFlightNumber(m[0]);
+    if (onPage !== normalizeFlightNumber(current.flightNumber)) {
+      err('wrong-booking sanity check FAILED on', pageLabel,
+          '— expected', current.flightNumber, 'got', onPage);
+      abort('flight_number_mismatch:' + pageLabel);
+      return false;
+    }
+    debug('flight number sanity check OK on', pageLabel, '→', onPage);
+    return true;
+  }
+
+  function finishCurrentFlightAsSuccess(simulated) {
+    const current = State.getCurrent();
+    if (!current) return;
+
+    const entry = { ...current, status: simulated ? 'success_simulated' : 'success', ts: Date.now() };
+    const processed = State.getProcessed();
+    processed.push(entry);
+    State.setProcessed(processed);
+
+    // Remove from queue
+    const queue = State.getQueue().filter(f =>
+      normalizeFlightNumber(f.flightNumber) !== normalizeFlightNumber(current.flightNumber));
+    State.setQueue(queue);
+
+    State.clearCurrent();
+    State.bumpStat('waitlisted');
+
+    if (!simulated) {
+      State.pushHistorical({ flight: current.flightNumber, dateISO: current.dateISO, ts: Date.now() });
+    }
+    log(simulated ? '✓ SIMULATED waitlist:' : '✓ WAITLISTED:', current.flightNumber, 'on', current.dateISO);
+  }
+
+  function guessSearchDateFromPage() {
+    // Best effort: scan visible text for ISO or JP date.
+    const txt = (document.body && document.body.innerText) || '';
+    const iso = txt.match(/\b(20\d{2})-(\d{2})-(\d{2})\b/);
+    if (iso) return iso[0];
+    const jp = txt.match(/(20\d{2})\D(\d{1,2})\D(\d{1,2})/);
+    if (jp) return `${jp[1]}-${jp[2].padStart(2, '0')}-${jp[3].padStart(2, '0')}`;
+    return null;
+  }
+
+  // ============================================================================
+  // 9. ROUTER
+  // ============================================================================
+  async function identifyPage() {
+    for (const [name, marker] of Object.entries(PAGE_MARKERS)) {
+      if (!marker.urlRegex.test(location.href)) continue;
+      const probe = await waitFor(SELECTORS[marker.probeKey], 2000);
+      if (probe) return name;
+    }
+    return 'UNKNOWN';
+  }
+
+  async function router() {
+    if (Safety.killSwitch()) return;
+    Safety.deadMansSwitch();
+
+    if (CONFIG.SELECTOR_DISCOVERY_MODE) Discovery.dumpAll();
+
+    if (Safety.checkCaptcha())  { abort('captcha'); return; }
+    if (Safety.checkRateLimit()){ abort('rate_limit'); return; }
+    if (Safety.checkLogout())   { abort('logged_out'); return; }
+
+    const s = State.load();
+    // Terminal phases: only handle search input page (to log idle message)
+    if (s.phase === PHASE.ABORTED) {
+      log('phase=ABORTED (' + s.abortReason + ').  Use Tampermonkey menu → "Stop / Reset" to clear.');
+      return;
+    }
+    if (s.phase === PHASE.DONE) {
+      log('phase=DONE.  Use Tampermonkey menu → "Stop / Reset" to start a new run.');
+      return;
+    }
+
+    const page = await identifyPage();
+    debug('identifyPage →', page, '| phase →', s.phase);
+
+    switch (page) {
+      case 'SEARCH_INPUT':     return handleSearchInput();
+      case 'RESULTS':          return handleResults();
+      case 'PAX_CONFIRM':      return handlePaxConfirm();
+      case 'ITINERARY_REVIEW': return handleItineraryReview();
+      case 'PERSONAL_INFO':    return handlePersonalInfo();
+      case 'FINAL_SUBMIT':     return handleFinalSubmit();
+      case 'SUCCESS':          return handleSuccess();
+      case 'CAPTCHA_OR_RL':    return abort('captcha_or_rate_limit');
+      case 'LOGIN':            return abort('logged_out');
+      default:                 return handleUnknown();
+    }
+  }
+
+  // ============================================================================
+  // 10. MENU + BOOTSTRAP
+  // ============================================================================
+  function registerMenuCommands() {
+    if (typeof GM_registerMenuCommand !== 'function') {
+      warn('GM_registerMenuCommand unavailable — menu commands disabled');
+      return;
+    }
+    GM_registerMenuCommand('▶ Start ANA Waitlist Run', () => {
+      State.reset();
+      const st = State.getStats(); st.startedAt = Date.now(); State.setStats(st);
+      State.setPhase(PHASE.INITIALIZING);
+      log('user triggered START');
+      router().catch(e => { err('router exception', e); abort('exception:' + e.message); });
+    });
+
+    GM_registerMenuCommand('■ Stop / Reset', () => {
+      log('user triggered STOP / RESET');
+      State.reset();
+    });
+
+    GM_registerMenuCommand('⚙ Toggle DRY_RUN (current: ' + Safety.isDryRun() + ')', () => {
+      const next = !Safety.isDryRun();
+      GM_setValue(GM_PREFIX + 'dryRunOverride', String(next));
+      log('DRY_RUN override set to', next, '(refresh menu to see updated label)');
+    });
+
+    GM_registerMenuCommand('📊 Print stats', () => printStats());
+
+    GM_registerMenuCommand('🔍 Toggle selector discovery (file-level: '
+      + CONFIG.SELECTOR_DISCOVERY_MODE + ')', () => {
+      // Runtime toggle stored in sessionStorage; takes effect on next page load
+      const cur = sessionStorage.getItem(KEY_PREFIX + 'discoveryOverride');
+      const next = cur === '1' ? '0' : '1';
+      sessionStorage.setItem(KEY_PREFIX + 'discoveryOverride', next);
+      // Patch CONFIG so this load also dumps if turning on
+      CONFIG.SELECTOR_DISCOVERY_MODE = next === '1';
+      log('discovery mode →', CONFIG.SELECTOR_DISCOVERY_MODE);
+      if (CONFIG.SELECTOR_DISCOVERY_MODE) Discovery.dumpAll();
+    });
+
+    GM_registerMenuCommand('🩺 Clear historical waitlist log (GM)', () => {
+      GM_deleteValue(GM_PREFIX + 'historicalWaitlists');
+      log('historical waitlist log cleared');
+    });
+  }
+
+  function bootstrap() {
+    if (window.top !== window.self) return; // no iframes
+
+    // Apply runtime discovery override (from menu) on top of CONFIG default
+    const discoOverride = sessionStorage.getItem(KEY_PREFIX + 'discoveryOverride');
+    if (discoOverride === '1') CONFIG.SELECTOR_DISCOVERY_MODE = true;
+    if (discoOverride === '0') CONFIG.SELECTOR_DISCOVERY_MODE = false;
+
+    registerMenuCommands();
+
+    log('loaded.  DRY_RUN=' + Safety.isDryRun()
+      + ' | discovery=' + CONFIG.SELECTOR_DISCOVERY_MODE
+      + ' | whitelist=' + CONFIG.THE_ROOM_WHITELIST.length + ' flights');
+
+    if (!CONFIG.AUTO_RESUME_AFTER_NAV) {
+      log('AUTO_RESUME_AFTER_NAV=false — router will not auto-fire on page load');
+      return;
+    }
+
+    router().catch(e => { err('router exception', e); abort('exception:' + e.message); });
+  }
+
+  if (document.readyState === 'complete') {
+    bootstrap();
+  } else {
+    window.addEventListener('load', bootstrap);
+  }
+})();
