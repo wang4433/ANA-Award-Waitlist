@@ -44,12 +44,13 @@
     // THE Room flight whitelist.  Verify against current seasonal deployment.
     // Compare is normalized (uppercase, no spaces, no leading zeros).
     THE_ROOM_WHITELIST: [
+      'NH112',                                 // HND-ORD — confirmed THE Room via SHA-ORD test
       'NH9', 'NH10', 'NH11', 'NH12',          // user-supplied seed
       'NH201', 'NH202', 'NH211', 'NH212',     // LHR
       'NH203', 'NH204',                        // LHR alt
       'NH223', 'NH224',                        // FRA
       // Candidates to verify before adding:
-      // 'NH105','NH106','NH109','NH110','NH111','NH112'
+      // 'NH105','NH106','NH109','NH110','NH111'
     ],
   };
 
@@ -69,15 +70,19 @@
       'input[type="submit"].btnVerticalMain.btnWidthVariable',
     ],
 
-    // Results page
-    resultsTable: ['#flightResultsTable', '.flight-results', 'table.results'],
-    resultsRow: ['tr.flight-row', 'tr[data-flight-no]', 'li.flight-item'],
-    resultsRowFlightNumber: ['.flight-number', '[data-flight-no]', '.flt-no'],
-    resultsRowWaitlistJButton: [
-      'button.waitlist-j',
-      '[data-cabin="J"] button.waitlist',
-      'a.waitlist-j',
-    ],
+    // Results page — ANA shows itineraries (not single flights) as divs
+    // wrapped in itinModeAvailabilityResult.  To proceed: click the
+    // td.selectItineraryCheck inside the target itinerary to select its
+    // radio, then click the page-bottom #nextButton to submit.  Itineraries
+    // requiring waitlisting show <p class="flagWait">Waitlisted</p>.  The
+    // flight-number label is a visually-hidden <label> like
+    // "FlightNH972,NH012" — easy to parse and order-stable.
+    resultsTable: ['form#searchContentsForm', '#main.noSummaryArea'],
+    resultsRow: 'div.itinModeAvailabilityResult',
+    resultsRowFlightNumber: 'label[id$="radioItemLabel"]',
+    resultsRowWaitlistJButton: 'td.selectItineraryCheck',
+    resultsRowWaitlistBadge: 'p.flagWait',
+    resultsNextButton: '#nextButton',
 
     // Multi-step confirmation pages
     paxConfirmMarker: ['#pax-confirm', '.passenger-confirm', '[data-page="passenger"]'],
@@ -103,7 +108,7 @@
   };
 
   // Selectors that MUST resolve or we hard-abort.
-  const CRITICAL_SELECTORS = ['searchSubmitButton', 'resultsRow', 'finalSubmitButton', 'successMarker'];
+  const CRITICAL_SELECTORS = ['searchSubmitButton', 'resultsRow', 'resultsNextButton', 'finalSubmitButton', 'successMarker'];
 
   // ============================================================================
   // 3. PAGE_MARKERS  — URL regex + DOM probe combos to identify the current page
@@ -448,12 +453,11 @@
 
   async function handleResults() {
     log('SCANNING_RESULTS');
-    const tableOrRow = await waitFor(SELECTORS.resultsRow);
-    if (!tableOrRow) { abort('missing_critical_selector:resultsRow'); return; }
+    const firstRow = await waitFor(SELECTORS.resultsRow);
+    if (!firstRow) { abort('missing_critical_selector:resultsRow'); return; }
 
     await sleep(CONFIG.POST_NAV_SETTLE_MS);
 
-    // Snapshot route/date once on first results visit
     const s = State.load();
     if (!s.searchDate) {
       s.searchDate = guessSearchDateFromPage();
@@ -461,70 +465,108 @@
     }
     const dateISO = s.searchDate || 'unknown-date';
 
-    const rows = qAll(SELECTORS.resultsRow);
-    debug('rows found:', rows.length);
+    const itineraryDivs = qAll(SELECTORS.resultsRow);
+    debug('itineraries found:', itineraryDivs.length);
 
-    // Build queue once per results visit
-    const processedFlightNos = new Set(State.getProcessed().map(f => normalizeFlightNumber(f.flightNumber)));
+    // Dedupe by THE Room flight: if 3 connection variants all contain NH112,
+    // we waitlist exactly one (the first).  User can edit if they want all.
+    const processedFlightNos = new Set(State.getProcessed().map(f =>
+      normalizeFlightNumber(f.flightNumber)));
     const queue = [];
 
-    for (const row of rows) {
-      const fnEl = row.querySelector(coalesce(SELECTORS.resultsRowFlightNumber)) || row;
-      const rawFn = (fnEl.innerText || fnEl.textContent || '').trim();
-      const fnMatch = rawFn.match(/[A-Z]{2}\s*\d{1,4}/i);
-      if (!fnMatch) continue;
-      const flightNumber = normalizeFlightNumber(fnMatch[0]);
+    itineraryDivs.forEach((div, idx) => {
+      const label = div.querySelector(coalesce(SELECTORS.resultsRowFlightNumber));
+      const labelText = label ? (label.textContent || '') : '';
+      const flightNos = (labelText.match(/[A-Z]{2}\s*\d{1,4}/g) || [])
+        .map(normalizeFlightNumber);
 
-      if (!isWhitelisted(flightNumber)) continue;
-      if (processedFlightNos.has(flightNumber)) continue;
-      if (State.isAlreadyDone(flightNumber, dateISO)) {
-        log('skip', flightNumber, '— already in GM historical for', dateISO);
-        const skipped = { flightNumber, dateISO, status: 'skipped_already_done' };
-        const p = State.getProcessed(); p.push(skipped); State.setProcessed(p);
-        State.bumpStat('skipped');
-        continue;
+      if (!flightNos.length) {
+        debug('itinerary', idx, '— no flight numbers in label, skipping');
+        return;
       }
 
-      const wlBtn = row.querySelector(coalesce(SELECTORS.resultsRowWaitlistJButton));
-      const eligible = wlBtn && !wlBtn.disabled && !wlBtn.classList.contains('disabled');
-      if (!eligible) {
-        log('skip', flightNumber, '— no waitlist button for J class (not eligible right now)');
-        const skipped = { flightNumber, dateISO, status: 'skipped_ineligible' };
-        const p = State.getProcessed(); p.push(skipped); State.setProcessed(p);
-        State.bumpStat('skipped');
-        continue;
+      const matched = flightNos.find(isWhitelisted);
+      if (!matched) {
+        debug('itinerary', idx, flightNos.join(','), '— no whitelisted match');
+        return;
       }
 
-      queue.push({ flightNumber, dateISO, status: 'pending' });
-    }
+      if (processedFlightNos.has(matched)) {
+        debug('itinerary', idx, '(' + matched + ') — already queued/processed this run');
+        return;
+      }
+
+      if (State.isAlreadyDone(matched, dateISO)) {
+        log('skip itinerary', idx, '— flight', matched, 'already in GM historical for', dateISO);
+        const skipped = { flightNumber: matched, dateISO, status: 'skipped_already_done', allFlights: flightNos };
+        const p = State.getProcessed(); p.push(skipped); State.setProcessed(p);
+        State.bumpStat('skipped');
+        processedFlightNos.add(matched);
+        return;
+      }
+
+      const selectTarget = div.querySelector(coalesce(SELECTORS.resultsRowWaitlistJButton));
+      if (!selectTarget) {
+        log('skip itinerary', idx, '(' + matched + ') — no selectItineraryCheck cell');
+        return;
+      }
+      // Absence of flagWait usually means seat is immediately confirmable
+      // (better than waitlist) rather than ineligible — still proceed.
+      const badge = div.querySelector(coalesce(SELECTORS.resultsRowWaitlistBadge));
+      if (!badge) debug('itinerary', idx, '— no flagWait badge; proceeding anyway (may be direct confirm)');
+
+      queue.push({
+        flightNumber: matched,
+        dateISO,
+        itineraryIndex: idx,
+        allFlights: flightNos,
+        status: 'pending',
+      });
+      processedFlightNos.add(matched);
+    });
 
     State.setQueue(queue);
-    log('queue built:', queue.length, 'matching flights');
+    log('queue built:', queue.length, 'whitelisted itinerar' + (queue.length === 1 ? 'y' : 'ies'));
 
     if (queue.length === 0) {
-      log('no whitelisted waitlist-eligible flights on this date — DONE');
+      log('no whitelisted THE Room itineraries on this date — DONE');
       State.setPhase(PHASE.DONE);
       printStats();
       return;
     }
 
-    // Pick first pending flight, click its waitlist button
     const next = queue[0];
-    log('proceeding with', next.flightNumber);
+    log('proceeding with itinerary', next.itineraryIndex,
+        '— flights:', next.allFlights.join(','),
+        '— THE Room flight:', next.flightNumber);
     State.setCurrent(next);
 
-    // Find row again by flight number text
-    const targetRow = findRowByFlightNumber(rows, next.flightNumber);
-    if (!targetRow) { abort('row_disappeared'); return; }
+    const itinDiv = itineraryDivs[next.itineraryIndex];
+    if (!itinDiv) { abort('itinerary_disappeared'); return; }
 
-    const wlBtn = targetRow.querySelector(coalesce(SELECTORS.resultsRowWaitlistJButton));
-    if (!wlBtn) { abort('waitlist_button_missing'); return; }
+    const selectTarget = itinDiv.querySelector(coalesce(SELECTORS.resultsRowWaitlistJButton));
+    if (!selectTarget) { abort('select_target_missing'); return; }
 
     State.setPhase(PHASE.SELECTING_FLIGHT);
-    await safeClick(wlBtn, `waitlist button for ${next.flightNumber}`);
 
-    // In DRY_RUN, no navigation will happen; simulate progression to keep the
-    // queue moving so the user can verify the full loop in dry-run.
+    // ANA pre-selects one itinerary by default.  Clicking the radio of an
+    // already-selected row may toggle it off — only click if not pressed.
+    const radio = selectTarget.querySelector('i[role="button"]');
+    const alreadySelected = radio && radio.getAttribute('aria-pressed') === 'true';
+    if (alreadySelected) {
+      debug('itinerary', next.itineraryIndex, 'already selected — skipping radio click');
+    } else {
+      await safeClick(selectTarget,
+        'selectItineraryCheck for itinerary ' + next.itineraryIndex + ' (' + next.flightNumber + ')');
+      await sleep(800); // let changeItineraryFlight() settle client-side state
+    }
+
+    const nextBtn = qFirst(SELECTORS.resultsNextButton);
+    if (!nextBtn) { abort('missing_critical_selector:resultsNextButton'); return; }
+    await safeClick(nextBtn, 'results page Next button');
+
+    // In DRY_RUN no navigation happens; simulate progression so the user can
+    // verify the full loop drains the queue.
     if (Safety.isDryRun()) {
       log('DRY_RUN: simulating success for', next.flightNumber);
       finishCurrentFlightAsSuccess(true /* simulated */);
@@ -651,7 +693,9 @@
     return null;
   }
 
-  /** Compare the flight number on the current page against state.currentFlight; abort on mismatch. */
+  /** Compare the flight number(s) on the current page against state.currentFlight;
+   *  abort on mismatch.  Multi-segment itineraries pass if the THE Room flight
+   *  appears, or as a fallback if any queued connection flight appears. */
   function verifyCurrentFlightOnPage(selectorOrArray, pageLabel) {
     const current = State.getCurrent();
     if (!current) { abort('no_current_flight'); return false; }
@@ -660,21 +704,34 @@
       warn('no flight-number element on', pageLabel, '— skipping sanity check');
       return true;
     }
-    const text = (el.innerText || el.textContent || '').trim();
-    const m = text.match(/[A-Z]{2}\s*\d{1,4}/i);
-    if (!m) {
-      warn('could not extract flight number on', pageLabel, '— text was:', text.slice(0, 80));
+    // Scan whole page text — multi-flight itineraries have flight numbers
+    // spread across several DOM nodes, so a single-element selector isn't
+    // enough.  Use the matched element's nearest container, fall back to body.
+    const scope = el.closest('form, #main, body') || document.body;
+    const text = (scope.innerText || scope.textContent || '').trim();
+    const found = (text.match(/[A-Z]{2}\s*\d{1,4}/g) || []).map(normalizeFlightNumber);
+    if (!found.length) {
+      warn('could not extract flight numbers on', pageLabel, '— text snippet:', text.slice(0, 200));
       return true;
     }
-    const onPage = normalizeFlightNumber(m[0]);
-    if (onPage !== normalizeFlightNumber(current.flightNumber)) {
-      err('wrong-booking sanity check FAILED on', pageLabel,
-          '— expected', current.flightNumber, 'got', onPage);
-      abort('flight_number_mismatch:' + pageLabel);
-      return false;
+    const expected = normalizeFlightNumber(current.flightNumber);
+    if (found.includes(expected)) {
+      debug('flight sanity check OK on', pageLabel, '→', expected, 'present');
+      return true;
     }
-    debug('flight number sanity check OK on', pageLabel, '→', onPage);
-    return true;
+    // Fall back: any connection flight in the queued itinerary present?
+    const allExpected = (current.allFlights || []).map(normalizeFlightNumber);
+    const matches = found.filter(f => allExpected.includes(f));
+    if (matches.length) {
+      warn('THE Room flight', expected, 'not on', pageLabel,
+           '— but connection flights match:', matches.join(','), '— continuing');
+      return true;
+    }
+    err('wrong-booking sanity check FAILED on', pageLabel,
+        '— expected', expected, '(or', allExpected.join(',') + ')',
+        'but page shows', found.slice(0, 8).join(','));
+    abort('flight_number_mismatch:' + pageLabel);
+    return false;
   }
 
   function finishCurrentFlightAsSuccess(simulated) {
