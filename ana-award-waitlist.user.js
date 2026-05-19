@@ -41,6 +41,15 @@
     MAX_STUCK_RETRIES: 3,              // give up on an UNKNOWN page after this many loads
     MAX_STALE_MS: 5 * 60 * 1000,       // dead-man's switch: reset if state is older than this
 
+    // ⚠️  PRIVACY: values here are stored in this script file.  Do NOT commit
+    // real personal data if this repo/file is public or shared.  Edit your
+    // LOCAL Tampermonkey copy and keep real values OUT of any committed
+    // version.  Set a value to '' to skip filling that field.
+    USER_INFO: {
+      phoneCountryCode: '', // ISO 2-letter; e.g. 'US' = USA/Canada, 'JP' = Japan, 'CN' = China
+      phoneNumber: '',      // digits only, no leading 0, no country code
+    },
+
     // THE Room flight whitelist.  Verify against current seasonal deployment.
     // Compare is normalized (uppercase, no spaces, no leading zeros).
     THE_ROOM_WHITELIST: [
@@ -104,9 +113,15 @@
       'div[class*="modal" i] button.btnMainStream',
     ],
 
-    personalInfoMarker: ['#personal-info', '.personal-info', '[data-page="personal"]'],
+    // Mandatory passenger info input page.  Selectors use [id$="..."]
+    // attribute-ends-with so they survive JSF's per-passenger index prefix
+    // (contactsSms:0:..., contactsSms:1:..., etc).  Currently targets the
+    // first passenger only — multi-pax bookings would need iteration.
+    personalInfoMarker: ['[id^="contactsSms"]', 'form[id*="mandatoryInfo" i]', 'form[id*="passenger" i]'],
     personalInfoAgreeCheckboxes: ['input.agree[type="checkbox"]', 'input[type="checkbox"][required]'],
-    personalInfoNextButton: ['button.next', '#toConfirm', 'input[type="submit"]'],
+    personalInfoPhoneCountrySelect: '[id$=":passengerSmsCountry"]',
+    personalInfoPhoneNumberInput: '[id$=":flightStatusNotificationContactPointSmsDescription"]',
+    personalInfoNextButton: '#nextButton',
 
     finalSubmitButton: ['#finalSubmit', 'button.submit-final', 'input[type="submit"][value*="確定" i]'],
     finalSubmitFlightNumber: ['.flt-num', '.flight-number', '[data-flight-no]'],
@@ -202,6 +217,15 @@
     if (el.offsetParent !== null) return true;
     const style = window.getComputedStyle(el);
     return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  }
+
+  /** Set a form-field value and fire the events client-side validation listens for. */
+  function setInputValue(el, value) {
+    el.focus();
+    el.value = value;
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+    el.blur();
   }
 
   /** Click with DRY_RUN respect and a small settle delay. */
@@ -641,6 +665,43 @@
     const marker = await waitFor(SELECTORS.personalInfoMarker);
     if (!marker) warn('personalInfoMarker not found — proceeding anyway');
 
+    await sleep(CONFIG.POST_NAV_SETTLE_MS);
+
+    const ui = CONFIG.USER_INFO || {};
+
+    // Fill phone country (US/JP/CN/etc).  Skipped if CONFIG value is empty.
+    if (ui.phoneCountryCode) {
+      const sel = qFirst(SELECTORS.personalInfoPhoneCountrySelect);
+      if (!sel) {
+        warn('phone country select not found — skipping');
+      } else if (sel.value === ui.phoneCountryCode) {
+        debug('phone country already', ui.phoneCountryCode);
+      } else if (Safety.isDryRun()) {
+        log('DRY_RUN: would set phone country to', ui.phoneCountryCode);
+      } else {
+        log('setting phone country →', ui.phoneCountryCode);
+        sel.value = ui.phoneCountryCode;
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        await sleep(200);
+      }
+    }
+
+    // Fill phone number.  Don't log the actual digits (PII).
+    if (ui.phoneNumber) {
+      const inp = qFirst(SELECTORS.personalInfoPhoneNumberInput);
+      if (!inp) {
+        warn('phone number input not found — skipping');
+      } else if (inp.value === ui.phoneNumber) {
+        debug('phone number already filled');
+      } else if (Safety.isDryRun()) {
+        log('DRY_RUN: would set phone number (' + ui.phoneNumber.length + ' digits)');
+      } else {
+        log('setting phone number (' + ui.phoneNumber.length + ' digits)');
+        setInputValue(inp, ui.phoneNumber);
+        await sleep(200);
+      }
+    }
+
     // Tick any required agreement checkboxes
     const checkboxes = qAll(SELECTORS.personalInfoAgreeCheckboxes);
     if (checkboxes.length) {
@@ -652,6 +713,14 @@
           await sleep(80);
         }
       }
+    }
+
+    // Surface any still-empty required inputs so the user can see what's missing
+    const stillEmpty = qAll('input[required]:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])')
+      .filter(i => !(i.value || '').trim());
+    if (stillEmpty.length) {
+      warn('after fill, still', stillEmpty.length, 'required input(s) empty:',
+        stillEmpty.slice(0, 6).map(i => i.id || i.name).join(' | '));
     }
 
     const btn = await waitFor(SELECTORS.personalInfoNextButton);
