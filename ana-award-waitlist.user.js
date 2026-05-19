@@ -122,6 +122,14 @@
     personalInfoPhoneCountrySelect: '[id$=":passengerSmsCountry"]',
     personalInfoPhoneNumberInput: '[id$=":flightStatusNotificationContactPointSmsDescription"]',
     personalInfoNextButton: '#nextButton',
+    // After clicking Next, ANA pops a passport-name confirmation modal.
+    // The OK button's onclick (Asw.Dialog.callOpener) is what actually
+    // submits the waitlist — treat this click as the final submission.
+    personalInfoNameConfirmOkButton: [
+      'input[aria-controls="prebookConfirmDialog"][value="OK"]',
+      '#prebookConfirmDialog input[type="submit"][value="OK"]',
+      'input.btnModal.btnMainStream[value="OK"]',
+    ],
 
     finalSubmitButton: ['#finalSubmit', 'button.submit-final', 'input[type="submit"][value*="確定" i]'],
     finalSubmitFlightNumber: ['.flt-num', '.flight-number', '[data-flight-no]'],
@@ -725,8 +733,34 @@
 
     const btn = await waitFor(SELECTORS.personalInfoNextButton);
     if (!btn) { abort('missing_selector:personalInfoNextButton'); return; }
-    State.setPhase(PHASE.FINAL_SUBMIT);
-    await safeClick(btn, 'personal info Next');
+
+    // Clicking Next on the pax info page triggers a passport-name confirmation
+    // modal — not navigation.  The OK button on that modal is the real submit.
+    await safeClick(btn, 'personal info Next (opens passport-name modal)');
+
+    await sleep(800);
+    const okBtn = await waitFor(SELECTORS.personalInfoNameConfirmOkButton, 5000);
+    if (!okBtn || !isVisible(okBtn)) {
+      warn('expected passport-name confirm modal but did not appear — page may have navigated unexpectedly');
+      return;
+    }
+
+    // OK is effectively the final-submit click.  Apply safety gates here.
+    const current = State.getCurrent();
+    if (!current) { abort('no_current_flight'); return; }
+    if (Safety.checkCap()) { abort('cap_reached'); return; }
+    if (!Safety.confirmFinal(current)) { abort('user_declined_confirm'); return; }
+
+    if (Safety.isDryRun()) {
+      log('DRY_RUN: would click OK on passport-name modal (submits waitlist for ' + current.flightNumber + ')');
+      finishCurrentFlightAsSuccess(true);
+      State.setPhase(PHASE.SCANNING_RESULTS);
+      return;
+    }
+
+    log('confirming passport-name modal — submitting waitlist for', current.flightNumber);
+    State.setPhase(PHASE.AWAITING_SUCCESS);
+    await safeClick(okBtn, 'passport-name OK button (submits waitlist)');
   }
 
   async function handleFinalSubmit() {
