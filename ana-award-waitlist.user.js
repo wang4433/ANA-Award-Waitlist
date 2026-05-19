@@ -88,9 +88,21 @@
     paxConfirmMarker: ['#pax-confirm', '.passenger-confirm', '[data-page="passenger"]'],
     paxConfirmNextButton: ['button.next', '#toItinerary', 'input[type="submit"]'],
 
-    itineraryMarker: ['#itinerary', '.itinerary-review', '[data-page="itinerary"]'],
-    itineraryFlightNumber: ['.flt-num', '.flight-number', '[data-flight-no]'],
-    itineraryNextButton: ['button.next', '#toPersonal', 'input[type="submit"]'],
+    // Itinerary review page — shown after clicking Next on results.  ANA pops
+    // a "availability may change" modal that must be dismissed before the
+    // page-bottom Next button is reachable.  Same #nextButton id as results.
+    itineraryMarker: ['form#searchContentsForm', '#main'],
+    itineraryFlightNumber: '#main',
+    itineraryNextButton: '#nextButton',
+    modalConfirmButton: [
+      // Discovered selectors get pinned here.  Defensive fallbacks:
+      '.cmnModalContents input[type="submit"][value="Confirm"]',
+      '[role="dialog"] input[type="submit"][value="Confirm"]',
+      '.modalContents input[value="Confirm"]',
+      'div[class*="modal" i] input[type="submit"][value="Confirm"]',
+      'div[class*="dialog" i] input[type="submit"][value="Confirm"]',
+      'div[class*="modal" i] button.btnMainStream',
+    ],
 
     personalInfoMarker: ['#personal-info', '.personal-info', '[data-page="personal"]'],
     personalInfoAgreeCheckboxes: ['input.agree[type="checkbox"]', 'input[type="checkbox"][required]'],
@@ -113,16 +125,20 @@
   // ============================================================================
   // 3. PAGE_MARKERS  — URL regex + DOM probe combos to identify the current page
   // ============================================================================
+  // Marker order matters — first match wins.  Keep narrow patterns above broad
+  // ones, otherwise broad ITINERARY_REVIEW would swallow PERSONAL_INFO etc.
   const PAGE_MARKERS = {
     SEARCH_INPUT:     { urlRegex: /award_search_roundtrip_input\.xhtml/i, probeKey: 'searchSubmitButton' },
-    RESULTS:          { urlRegex: /award_search_roundtrip_(result|select)|select_flight/i, probeKey: 'resultsRow' },
-    PAX_CONFIRM:      { urlRegex: /pax_confirm|passenger/i, probeKey: 'paxConfirmMarker' },
-    ITINERARY_REVIEW: { urlRegex: /itinerary|fare_confirm/i, probeKey: 'itineraryMarker' },
-    PERSONAL_INFO:    { urlRegex: /personal_info|contact/i, probeKey: 'personalInfoMarker' },
-    FINAL_SUBMIT:     { urlRegex: /final_confirm|booking_confirm/i, probeKey: 'finalSubmitButton' },
+    RESULTS:          { urlRegex: /award_search_roundtrip_result_/i, probeKey: 'resultsRow' },
+    PERSONAL_INFO:    { urlRegex: /mandatory_passenger|passenger_information_input|personal_info|contact/i, probeKey: 'personalInfoMarker' },
+    PAX_CONFIRM:      { urlRegex: /pax_confirm|passenger_(?!information_input)/i, probeKey: 'paxConfirmMarker' },
+    FINAL_SUBMIT:     { urlRegex: /final_confirm|booking_confirm|reservation_confirm/i, probeKey: 'finalSubmitButton' },
     SUCCESS:          { urlRegex: /complete|success|booking_complete/i, probeKey: 'successMarker' },
     CAPTCHA_OR_RL:    { urlRegex: /error|maintenance|captcha/i, probeKey: 'captchaMarker' },
     LOGIN:            { urlRegex: /login|signin/i, probeKey: 'logoutMarker' },
+    // Broad catch-all — anything else under /award/ is treated as itinerary
+    // review.  Last in order so narrower markers above win first.
+    ITINERARY_REVIEW: { urlRegex: /\/award_/i, probeKey: 'itineraryMarker' },
   };
 
   // ============================================================================
@@ -178,6 +194,14 @@
       }
     }
     return [];
+  }
+
+  /** Is the element actually visible (not display:none / visibility:hidden / detached)? */
+  function isVisible(el) {
+    if (!el) return false;
+    if (el.offsetParent !== null) return true;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
   }
 
   /** Click with DRY_RUN respect and a small settle delay. */
@@ -590,12 +614,26 @@
     const marker = await waitFor(SELECTORS.itineraryMarker);
     if (!marker) warn('itineraryMarker not found — proceeding anyway');
 
+    await sleep(CONFIG.POST_NAV_SETTLE_MS);
+
+    // ANA pops an "availability may change" notice modal on this page.
+    // Dismiss it (single Confirm button) before clicking Next.  No-op if the
+    // modal isn't shown (e.g. already dismissed in this session).
+    const modalBtn = qFirst(SELECTORS.modalConfirmButton);
+    if (modalBtn && isVisible(modalBtn)) {
+      log('dismissing availability-change modal');
+      await safeClick(modalBtn, 'modal Confirm button');
+      await sleep(700);
+    } else {
+      debug('no visible modal to dismiss');
+    }
+
     if (!verifyCurrentFlightOnPage(SELECTORS.itineraryFlightNumber, 'itinerary review')) return;
 
     const btn = await waitFor(SELECTORS.itineraryNextButton);
     if (!btn) { abort('missing_selector:itineraryNextButton'); return; }
     State.setPhase(PHASE.PERSONAL_INFO);
-    await safeClick(btn, 'itinerary Next');
+    await safeClick(btn, 'itinerary review Next');
   }
 
   async function handlePersonalInfo() {
