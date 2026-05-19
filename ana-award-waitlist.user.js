@@ -131,11 +131,28 @@
       'input.btnModal.btnMainStream[value="OK"]',
     ],
 
-    finalSubmitButton: ['#finalSubmit', 'button.submit-final', 'input[type="submit"][value*="確定" i]'],
-    finalSubmitFlightNumber: ['.flt-num', '.flight-number', '[data-flight-no]'],
+    // Payment / final-submit page = award_payment_information_input.xhtml
+    // Flow: dismiss "Miles will be taken" notice modal → tick consent
+    // checkbox → click #purchaseButton → wait for purchaseDialog modal →
+    // click its OK → waitlist actually submitted → success page loads.
+    finalSubmitButton: '#purchaseButton',
+    finalSubmitFlightNumber: '#main',
+    finalSubmitInitialNoticeConfirm: [
+      // "Miles will be taken from the account..." modal.  aria-controls has a
+      // JSF prefix (j_idt343:0:cmnDynamicMessageWindow) — match by suffix.
+      'input[aria-controls*="cmnDynamicMessageWindow"][value="Confirm"]',
+      'input.btnModal.btnMainStream[value="Confirm"]',
+    ],
+    finalSubmitConsentCheckbox: '[id$=":detailRuleMessageCheckbox"]',
+    finalSubmitConfirmOkButton: [
+      // Final "Would you like to proceed with this waitlist request?" modal
+      'input[aria-controls="purchaseDialog"][value="OK"]',
+      '#purchaseDialog input[type="submit"][value="OK"]',
+    ],
 
-    successMarker: ['.booking-complete', '#success', '[data-page="complete"]'],
-    successBackToResultsLink: ['a.back-to-results', 'a[href*="search"]'],
+    // Success page = award_reservation_purchase_complete.xhtml
+    successMarker: ['#main', '.booking-complete', '#success'],
+    successBackToResultsLink: ['a[href*="search"]', 'a.back-to-top', 'a[href*="top"]'],
 
     // Error / abort conditions
     captchaMarker: ['#captcha', '.error-rate-limit', '.g-recaptcha'],
@@ -155,8 +172,8 @@
     RESULTS:          { urlRegex: /award_search_roundtrip_result_/i, probeKey: 'resultsRow' },
     PERSONAL_INFO:    { urlRegex: /mandatory_passenger|passenger_information_input|personal_info|contact/i, probeKey: 'personalInfoMarker' },
     PAX_CONFIRM:      { urlRegex: /pax_confirm|passenger_(?!information_input)/i, probeKey: 'paxConfirmMarker' },
-    FINAL_SUBMIT:     { urlRegex: /final_confirm|booking_confirm|reservation_confirm/i, probeKey: 'finalSubmitButton' },
-    SUCCESS:          { urlRegex: /complete|success|booking_complete/i, probeKey: 'successMarker' },
+    FINAL_SUBMIT:     { urlRegex: /award_payment_information_input|payment_information|final_confirm|booking_confirm|reservation_confirm/i, probeKey: 'finalSubmitButton' },
+    SUCCESS:          { urlRegex: /award_reservation_purchase_complete|purchase_complete|booking_complete|complete|success/i, probeKey: 'successMarker' },
     CAPTCHA_OR_RL:    { urlRegex: /error|maintenance|captcha/i, probeKey: 'captchaMarker' },
     LOGIN:            { urlRegex: /login|signin/i, probeKey: 'logoutMarker' },
     // Broad catch-all — anything else under /award/ is treated as itinerary
@@ -735,59 +752,97 @@
     if (!btn) { abort('missing_selector:personalInfoNextButton'); return; }
 
     // Clicking Next on the pax info page triggers a passport-name confirmation
-    // modal — not navigation.  The OK button on that modal is the real submit.
+    // modal — not navigation.  The OK button on that modal just advances to
+    // the payment page (where the actual waitlist submit happens).
     await safeClick(btn, 'personal info Next (opens passport-name modal)');
 
     await sleep(800);
     const okBtn = await waitFor(SELECTORS.personalInfoNameConfirmOkButton, 5000);
     if (!okBtn || !isVisible(okBtn)) {
-      warn('expected passport-name confirm modal but did not appear — page may have navigated unexpectedly');
+      warn('expected passport-name confirm modal but did not appear');
       return;
     }
 
-    // OK is effectively the final-submit click.  Apply safety gates here.
+    State.setPhase(PHASE.FINAL_SUBMIT);
+    await safeClick(okBtn, 'passport-name OK (advances to payment page)');
+  }
+
+  async function handleFinalSubmit() {
+    log('FINAL_SUBMIT (payment page)');
     const current = State.getCurrent();
     if (!current) { abort('no_current_flight'); return; }
+
+    await waitFor(SELECTORS.finalSubmitButton);
+    await sleep(CONFIG.POST_NAV_SETTLE_MS);
+
+    // 1) Dismiss the "Miles will be taken from the account" notice modal
+    //    that ANA shows on payment-page load.
+    const noticeBtn = qFirst(SELECTORS.finalSubmitInitialNoticeConfirm);
+    if (noticeBtn && isVisible(noticeBtn)) {
+      log('dismissing mileage-deduction notice modal');
+      await safeClick(noticeBtn, 'mileage-deduction notice Confirm');
+      await sleep(700);
+    } else {
+      debug('no mileage-deduction notice modal to dismiss');
+    }
+
+    // 2) Verify the right flight is on this page
+    if (!verifyCurrentFlightOnPage(SELECTORS.finalSubmitFlightNumber, 'payment page')) return;
+
+    // 3) Tick the "I have read and agreed" consent checkbox
+    const checkbox = qFirst(SELECTORS.finalSubmitConsentCheckbox);
+    if (!checkbox) {
+      abort('missing_selector:finalSubmitConsentCheckbox');
+      return;
+    }
+    if (!checkbox.checked) {
+      if (Safety.isDryRun()) {
+        log('DRY_RUN: would tick consent checkbox');
+      } else {
+        log('ticking consent checkbox');
+        checkbox.click();
+        await sleep(300);
+        // Defensive: if the click didn't take (custom widget), force it
+        if (!checkbox.checked) {
+          debug('checkbox.click() did not register — forcing checked=true');
+          checkbox.checked = true;
+          checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+          await sleep(200);
+        }
+      }
+    } else {
+      debug('consent checkbox already ticked');
+    }
+
+    // 4) Safety gates BEFORE the click that opens the final-confirm modal
     if (Safety.checkCap()) { abort('cap_reached'); return; }
     if (!Safety.confirmFinal(current)) { abort('user_declined_confirm'); return; }
 
+    // 5) Click "Waitlisting Request" → opens purchaseDialog modal
+    const purchaseBtn = await waitFor(SELECTORS.finalSubmitButton);
+    if (!purchaseBtn) { abort('missing_critical_selector:finalSubmitButton'); return; }
+
     if (Safety.isDryRun()) {
-      log('DRY_RUN: would click OK on passport-name modal (submits waitlist for ' + current.flightNumber + ')');
+      log('DRY_RUN: would click Waitlisting Request + OK on confirm modal — submits waitlist for', current.flightNumber);
       finishCurrentFlightAsSuccess(true);
       State.setPhase(PHASE.SCANNING_RESULTS);
       return;
     }
 
-    log('confirming passport-name modal — submitting waitlist for', current.flightNumber);
-    State.setPhase(PHASE.AWAITING_SUCCESS);
-    await safeClick(okBtn, 'passport-name OK button (submits waitlist)');
-  }
+    log('clicking Waitlisting Request — opens final confirm modal');
+    await safeClick(purchaseBtn, 'Waitlisting Request button');
 
-  async function handleFinalSubmit() {
-    log('FINAL_SUBMIT');
-    const current = State.getCurrent();
-    if (!current) { abort('no_current_flight'); return; }
-
-    if (!verifyCurrentFlightOnPage(SELECTORS.finalSubmitFlightNumber, 'final submit')) return;
-
-    // Safety gates
-    if (Safety.checkCap()) { abort('cap_reached'); return; }
-    if (!Safety.confirmFinal(current)) { abort('user_declined_confirm'); return; }
-
-    const btn = await waitFor(SELECTORS.finalSubmitButton);
-    if (!btn) { abort('missing_critical_selector:finalSubmitButton'); return; }
-
-    if (Safety.isDryRun()) {
-      log('DRY_RUN: would click FINAL submit for', current.flightNumber, 'on', current.dateISO);
-      finishCurrentFlightAsSuccess(true /* simulated */);
-      State.setPhase(PHASE.SCANNING_RESULTS);
-      // In real run, navigation drives next page.  In DRY_RUN we have no
-      // navigation so just stop here.  The user can re-trigger from results.
+    // 6) Wait for the purchaseDialog confirm modal, then click OK to submit
+    await sleep(800);
+    const okBtn = await waitFor(SELECTORS.finalSubmitConfirmOkButton, 6000);
+    if (!okBtn || !isVisible(okBtn)) {
+      abort('purchase_confirm_modal_did_not_appear');
       return;
     }
 
+    log('confirming purchase modal — SUBMITTING waitlist for', current.flightNumber);
     State.setPhase(PHASE.AWAITING_SUCCESS);
-    btn.click();
+    await safeClick(okBtn, 'purchaseDialog OK (actual waitlist submit)');
   }
 
   async function handleSuccess() {
