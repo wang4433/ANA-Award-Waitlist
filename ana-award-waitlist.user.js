@@ -60,11 +60,13 @@
   // ============================================================================
   const SELECTORS = {
     // Search input page
+    // ANA uses JSF, so name="j_idt1080" is auto-generated and renumbers between
+    // builds — never rely on it.  Anchor on type+value (English/Japanese UI) or
+    // the page-specific class combo.
     searchSubmitButton: [
-      '#searchSubmit',
-      'button[name="search"]',
-      'input[type="submit"][value*="検索" i]',
-      'button.btn-search',
+      'input[type="submit"][value="Search"]',
+      'input[type="submit"][value="検索"]',
+      'input[type="submit"].btnVerticalMain.btnWidthVariable',
     ],
 
     // Results page
