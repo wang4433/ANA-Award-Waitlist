@@ -852,13 +852,24 @@
 
     finishCurrentFlightAsSuccess(false);
 
-    // Navigate back to results to process next flight
+    // If the queue is empty, stop here — no point navigating away from a
+    // successful booking confirmation page when there's no more work.
+    const remaining = State.getQueue().length;
+    if (remaining === 0) {
+      log('queue empty after this waitlist — DONE');
+      State.setPhase(PHASE.DONE);
+      printStats();
+      return;
+    }
+
+    // Otherwise navigate back to results to process the next flight.
+    log(remaining, 'flight(s) still in queue — returning to results');
     State.setPhase(PHASE.RETURNING_TO_RESULTS);
     const backLink = qFirst(SELECTORS.successBackToResultsLink);
     if (backLink) {
       await safeClick(backLink, 'back-to-results link');
     } else {
-      log('no back-to-results link — using history.back()');
+      warn('no back-to-results link found on success page — using history.back()');
       history.back();
     }
   }
